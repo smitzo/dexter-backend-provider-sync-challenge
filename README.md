@@ -125,7 +125,7 @@ src/dexter_sync/
   models.py            # Pydantic models + provider->internal mapping
   exceptions.py        # Error hierarchy: provider, rate-limit, malformed-record
   provider_client.py   # Mock provider — reads JSON fixtures, simulates failures
-  repository.py        # In-memory Firestore-like store, no business logic
+  repository.py        # In-memory Firestore-like store + conditional write guard
   sync.py              # Orchestrator — your main focus
 tests/
   conftest.py
@@ -158,27 +158,101 @@ Please include in your README:
 
 ---
 
-## Your Notes (fill this in)
+## Your Notes
 
-> Replace this section with your approach, assumptions, tradeoffs, known
-> gaps, AI tool usage, and how you verified the solution.
+### What changed
+
+- Added full pagination in `run_sync`, including retry handling for 429/5xx
+  failures, clean stop on permanent provider errors, and a repeated-cursor
+  guard to avoid infinite loops.
+- Added idempotent conditional write behavior in the repository: fresh
+  residents increment `created`, newer provider records increment `updated`,
+  stale or equal provider records increment `skipped`, and invalid records
+  increment `failed` without blocking valid records.
+- Hardened provider mapping in `Resident.from_provider_payload`: required
+  identifiers and names, `first_name` + `lastName` to `full_name`, ISO `dob`
+  parsing, polymorphic `care_level` normalization, `deleted_at` precedence,
+  and contextual `MalformedRecordError`s.
+- Added edge-case tests in `tests/test_sync_reliability.py` for retries,
+  duplicate cursor handling, the judgment fixture mapping rules, ignoring
+  `last_modified_by_caregiver` for stale-write protection, and repository-level
+  stale-write protection.
+
+### Tradeoffs and known gaps
+
+- Retry behavior uses three total attempts with tiny local backoff for 5xx and
+  capped `Retry-After` sleeps for rate limits. That keeps tests deterministic
+  and avoids long local runs while still exercising the provider's transient
+  failure contract.
+- Unknown or out-of-range `care_level` values fail the individual record
+  instead of coercing them. I chose data quality over guessing because care
+  level is clinically meaningful.
+- Stale-write protection lives in `InMemoryRepository.upsert_resident_if_newer`
+  and uses a lock around read/compare/write. In Firestore, this same boundary
+  would map to a transaction or conditional document write.
+
+### AI usage and verification
+
+I used Chatgpt and Claude to inspect the codebase, verify the sync reliability changes,
+think about edge cases, and update this memo. I used AI to quickly learn about
+threading, locks and timezone implementation for this project as well.
+
+Validation run:
+
+```bash
+venv\Scripts\pytest.exe
+venv\Scripts\ruff.exe check .
+venv\Scripts\mypy.exe --no-incremental src  # mypy internal error
+```
+
+Honest time spent: 40 mins for understanding existing codebase and figuring out
+what is missing, 30 mins to understand the edge cases and what I need to implement,
+1 hour for final code implementation and verificaiton (manual + AI) and 30 mins for 
+updating and verifying documentation (using AI)
 
 ### Decision memo
-
-Briefly answer (4-8 sentences total):
-
 1. How did you handle the polymorphic `care_level` field documented in
    `docs/PROVIDER_API.md`?
+- **Polymorphic `care_level`:** I normalize the documented provider variants
+   into one internal shape: integers, numeric strings like `"3"`, and
+   case-insensitive prefixed strings like `"level_3"` or `"Level_3"` all become
+   `int`, while `null` becomes `None`. I also validate the final value is in the
+   documented `0..5` range. I intentionally reject unknown forms such as
+   `"assisted"` or out-of-range values as malformed records instead of guessing,
+   because care level is operationally important care data and a silent wrong
+   value would be worse than a visible record-level failure.
+
 2. When a record carries both `is_active` and `deleted_at`, which wins, and
    why?
+- **`is_active` vs `deleted_at`:** If both fields are present, `deleted_at`
+   wins. The provider docs make `deleted_at` the newer authoritative removal
+   signal, while `is_active` can be a legacy or temporary status flag. In code,
+   the effective internal value is `is_active=False` whenever `deleted_at` is
+   set, even if the provider also sends `is_active=true`.
+
 3. Did you use `last_updated` or `last_modified_by_caregiver` for stale-write
    protection? Why?
+- **Stale-write timestamp:** I use provider `last_updated` for stale-write
+   protection and compare it against the internal `updated_at`. I ignore
+   `last_modified_by_caregiver` for this decision because the docs explicitly
+   call it informational and say `last_updated` remains canonical for sync.
+   Practically, this means a provider record only overwrites an existing
+   resident when its canonical server-side timestamp is newer; equal or older
+   records are skipped to keep sync re-runs idempotent.
+
 4. **Past the table.** The Binding rules section of `docs/PROVIDER_API.md`
    resolves the documented cases. For each of the three above, name **one
    edge case the docs do NOT pin down** (e.g., an unknown `care_level`
    variant; `deleted_at` arriving in the future or being un-set on a later
    sync; a real situation in which `last_modified_by_caregiver` should
    matter for staleness) and how your code handles it.
-
-We will challenge these decisions with a fresh provider example in the
-technical interview.
+- **Ambiguous edge cases beyond the table:** For an unknown `care_level`
+   variant such as `"assisted"`, the code fails only that record and continues
+   syncing valid residents. For a future `deleted_at`, the code still treats
+   the resident as inactive because the docs do not define scheduled deletion
+   semantics, and the safest consistent interpretation is "set means removed."
+   For a real caregiver-tablet edit where `last_modified_by_caregiver` is newer
+   than `last_updated`, the code still skips or updates based only on
+   `last_updated`; if the provider later decides caregiver edits should affect
+   staleness, I would change the binding rule in one place rather than mixing
+   timestamp precedence ad hoc in the sync.
